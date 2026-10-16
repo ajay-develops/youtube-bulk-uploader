@@ -1,0 +1,17 @@
+{
+  "name": "youtube-bulk-uploader",
+  "version": "0.1.0",
+  "description": "Desktop app that bulk-uploads videos from an external SSD to a YouTube channel.",
+  "main": "src/main/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}

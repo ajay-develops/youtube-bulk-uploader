@@ -1,0 +1,14 @@
+*.pem
+.DS_Store
+.env
+__pycache__/
+bin/
+certs/
+client_secret.json
+credentials/
+data/
+dist/
+legacy/state/
+logs/
+node_modules/
+token.json

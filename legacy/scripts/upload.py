@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+Dev Video Offload -- main upload script.
+
+Scans the FINAL OUTPUTS folder on the Portable SSD recursively, uploads any
+video files not yet uploaded to Dev Saroha's YouTube channel as Unlisted,
+respecting a safe daily quota cap, and only when the SSD is connected, this
+Mac has a working internet connection, and the upload speed is good enough.
+Can also be paused/resumed, and triggered manually, from the dashboard
+(https://yt-upload-progress.local).
+
+Safe to run repeatedly (via the LaunchAgent on a timer, manually via
+"Upload Now.command", or via the dashboard's "Retry uploads now" button) --
+it always resumes from where it left off using manifest.json, never
+re-uploads a file that's already marked done, skips macOS's hidden
+"._"-prefixed AppleDouble metadata sidecar files (which otherwise look like
+real videos to a plain extension filter), and uses a file lock so two runs
+can never overlap and race on the same manifest.
+"""
+
+import fcntl
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(os.path.expanduser("~/dev-saroha-youtube-upload"))
+CREDENTIALS_DIR = BASE_DIR / "credentials"
+TOKEN_FILE = CREDENTIALS_DIR / "token.json"
+MANIFEST_FILE = BASE_DIR / "manifest.json"
+LOG_FILE = BASE_DIR / "logs" / "upload.log"
+PAUSE_FILE = BASE_DIR / "paused.flag"
+LOCK_FILE = BASE_DIR / "upload.lock"
+QUOTA_FLAG_FILE = BASE_DIR / "quota_exhausted.flag"
+
+SSD_ROOT = Path("/Volumes/PortableSSD/DEV DATA/personal/FINAL OUTPUTS")
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mpg", ".mpeg", ".mts", ".m2ts"}
+
+DAILY_UPLOAD_CAP = 95         # safety margin under the real 100/day videos.insert quota
+MIN_UPLOAD_SPEED_MBPS = 2.0
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def log(msg):
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = "[{}] {}".format(datetime.now().isoformat(timespec="seconds"), msg)
+    print(line)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock -- so the scheduled run, "Upload Now.command", and the
+# dashboard's "Retry uploads now" button can never race on manifest.json.
+# ---------------------------------------------------------------------------
+
+def acquire_lock():
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        return None
+    try:
+        os.chmod(LOCK_FILE, 0o666)
+    except Exception:
+        pass
+    return fp
+
+
+# ---------------------------------------------------------------------------
+# Manifest (resumable state -- survives restarts, sleep, crashes)
+# ---------------------------------------------------------------------------
+
+def load_manifest():
+    if MANIFEST_FILE.exists():
+        with open(MANIFEST_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_manifest(manifest):
+    tmp = MANIFEST_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    tmp.replace(MANIFEST_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Guards: pause flag, SSD, internet, upload speed
+# ---------------------------------------------------------------------------
+
+def is_paused():
+    return PAUSE_FILE.exists()
+
+
+def ssd_connected():
+    return SSD_ROOT.is_dir()
+
+
+def internet_connected():
+    """
+    Generic internet reachability check -- doesn't care whether the link is
+    WiFi, Ethernet, or anything else (the old WiFi-specific check via
+    `networksetup -getairportnetwork` was unreliable on this Mac and kept
+    reporting "not connected" even while it was online on WiFi).
+    """
+    for host, port in (("8.8.8.8", 53), ("1.1.1.1", 53), ("1.1.1.1", 443)):
+        try:
+            s = socket.create_connection((host, port), timeout=5)
+            s.close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def upload_speed_mbps():
+    try:
+        import speedtest
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        upload_bps = st.upload()
+        return upload_bps / 1_000_000
+    except Exception as e:
+        log("Speed test failed ({}); treating as 0 Mbps.".format(e))
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Quota-day tracking (YouTube's daily quota resets at midnight Pacific Time)
+# ---------------------------------------------------------------------------
+
+def pacific_date_str():
+    try:
+        env = os.environ.copy()
+        env["TZ"] = "America/Los_Angeles"
+        out = subprocess.run(["date", "+%Y-%m-%d"], capture_output=True, text=True, timeout=10, env=env)
+        return out.stdout.strip()
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def uploads_done_today(manifest, today):
+    return sum(
+        1 for entry in manifest.values()
+        if entry.get("status") == "uploaded" and entry.get("upload_date_pt") == today
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scanning and title generation
+# ---------------------------------------------------------------------------
+
+def is_junk_sidecar(path):
+    """
+    macOS writes hidden "._<name>" AppleDouble sidecar files (tiny resource-fork
+    metadata stubs, typically a few KB) alongside real files whenever it copies
+    to a non-native filesystem (exFAT/NTFS SSDs, network shares, etc). Since the
+    sidecar keeps the original extension (e.g. "._tfh 1507.mp4"), a plain
+    extension filter treats it as a real video -- it isn't.
+    """
+    name = path.name
+    return name.startswith("._") or name == ".DS_Store"
+
+
+def scan_videos():
+    videos = []
+    for path in SSD_ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        if is_junk_sidecar(path):
+            continue
+        if path.suffix.lower() in VIDEO_EXTENSIONS:
+            videos.append(path)
+    return videos
+
+
+def make_title(path):
+    rel = path.relative_to(SSD_ROOT)
+    parts = list(rel.parts[:-1])
+    stem = rel.stem
+    stem = re.sub(r"[_]+", " ", stem).strip()
+    parts = [re.sub(r"[_]+", " ", p).strip() for p in parts]
+    title = " - ".join(parts + [stem]) if parts else stem
+    title = title.strip()
+    if not title:
+        # Degenerate filename (e.g. literally " .mp4") -- fall back to
+        # something non-empty so the upload doesn't get a blank title.
+        title = " - ".join(parts + ["Untitled"]) if parts else "Untitled"
+    return title[:100]  # YouTube title length limit
+
+
+# ---------------------------------------------------------------------------
+# YouTube auth + upload
+# ---------------------------------------------------------------------------
+
+def get_youtube_client():
+    if not TOKEN_FILE.exists():
+        log("ERROR: no token.json found -- run authorize.py first.")
+        sys.exit(1)
+
+    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+
+    return build("youtube", "v3", credentials=creds)
+
+
+QUOTA_ERROR_MARKERS = (
+    "uploadlimitexceeded",
+    "ratelimitexceeded",
+    "quotaexceeded",
+    "dailylimitexceeded",
+    "exceeded the number of videos they may upload",
+    "quota exceeded for quota metric",
+)
+
+
+def is_quota_error(e):
+    """True if this HttpError means we're out of upload quota / hit the
+    account's daily video-upload limit -- not that this specific file is
+    bad. On this, the run should stop immediately rather than storming
+    through the rest of the backlog making doomed calls."""
+    text = str(e).lower()
+    return any(marker in text for marker in QUOTA_ERROR_MARKERS)
+
+
+def upload_video(youtube, path, title):
+    body = {
+        "snippet": {"title": title, "description": ""},
+        "status": {"privacyStatus": "unlisted"},
+    }
+    media = MediaFileUpload(str(path), chunksize=10 * 1024 * 1024, resumable=True)
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            log("  ... {}% uploaded".format(int(status.progress() * 100)))
+    return response["id"]
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run():
+    if is_paused():
+        log("Uploads paused via dashboard. Skipping this run.")
+        return
+
+    if not ssd_connected():
+        log("SSD not connected. Skipping this run.")
+        return
+
+    if not internet_connected():
+        log("No internet connection detected. Skipping this run.")
+        return
+
+    manifest = load_manifest()
+    today = pacific_date_str()
+
+    if QUOTA_FLAG_FILE.exists():
+        try:
+            flagged_date = QUOTA_FLAG_FILE.read_text().strip()
+        except Exception:
+            flagged_date = ""
+        if flagged_date == today:
+            log("YouTube already reported the daily upload limit reached today ({} Pacific). Skipping until tomorrow.".format(today))
+            return
+
+    done_today = uploads_done_today(manifest, today)
+    remaining_today = DAILY_UPLOAD_CAP - done_today
+
+    if remaining_today <= 0:
+        log("Daily quota cap ({}) already used for {} (Pacific). Skipping this run.".format(DAILY_UPLOAD_CAP, today))
+        return
+
+    videos = scan_videos()
+    todo = []
+    for path in videos:
+        key = str(path.relative_to(SSD_ROOT))
+        entry = manifest.get(key)
+        if entry and entry.get("status") == "uploaded":
+            continue
+        if entry and entry.get("status") == "failed" and entry.get("attempts", 0) >= 5:
+            continue
+        todo.append((key, path))
+
+    if not todo:
+        if not videos:
+            log("No video files found under FINAL OUTPUTS. Nothing to do.")
+        else:
+            log("Nothing left to upload. All done!")
+        return
+
+    speed = upload_speed_mbps()
+    log("Measured upload speed: {:.2f} Mbps".format(speed))
+    if speed < MIN_UPLOAD_SPEED_MBPS:
+        log("Upload speed below {} Mbps threshold. Skipping this run.".format(MIN_UPLOAD_SPEED_MBPS))
+        return
+
+    youtube = get_youtube_client()
+
+    uploaded_this_run = 0
+    for key, path in todo:
+        if is_paused():
+            log("Paused via dashboard mid-run. Stopping.")
+            break
+
+        if uploaded_this_run >= remaining_today:
+            log("Reached today's cap of {} uploads. Stopping until tomorrow (Pacific).".format(DAILY_UPLOAD_CAP))
+            break
+
+        title = make_title(path)
+        log('Uploading: {}  ->  title: "{}"'.format(key, title))
+
+        entry = manifest.get(key, {"attempts": 0})
+
+        try:
+            video_id = upload_video(youtube, path, title)
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            entry.update({
+                "status": "uploaded",
+                "youtube_id": video_id,
+                "title": title,
+                "upload_date_pt": pacific_date_str(),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            })
+            log("  Success: https://youtu.be/{}".format(video_id))
+            uploaded_this_run += 1
+            manifest[key] = entry
+            save_manifest(manifest)
+        except HttpError as e:
+            if is_quota_error(e):
+                log("  YouTube says the daily upload limit is reached: {}".format(e))
+                log("Stopping this run -- not this file's fault; will retry tomorrow (Pacific) without spending its retry budget.")
+                try:
+                    QUOTA_FLAG_FILE.write_text(pacific_date_str())
+                    os.chmod(str(QUOTA_FLAG_FILE), 0o666)
+                except Exception:
+                    pass
+                break
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            entry["status"] = "failed"
+            entry["last_error"] = str(e)
+            log("  FAILED: {}".format(e))
+            manifest[key] = entry
+            save_manifest(manifest)
+        except Exception as e:
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            entry["status"] = "failed"
+            entry["last_error"] = str(e)
+            log("  FAILED (unexpected error): {}".format(e))
+            manifest[key] = entry
+            save_manifest(manifest)
+
+        if not ssd_connected():
+            log("SSD disconnected mid-run. Stopping.")
+            break
+
+    log("=== Run finished. Uploaded {} video(s) this run. ===".format(uploaded_this_run))
+
+
+def main():
+    log("=== Run started ===")
+
+    lock_fp = acquire_lock()
+    if lock_fp is None:
+        log("Another upload run is already in progress. Skipping this run.")
+        return
+
+    try:
+        run()
+    finally:
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fp.close()
+
+
+if __name__ == "__main__":
+    main()

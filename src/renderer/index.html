@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'">
+  <title>YouTube Bulk Uploader</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>YouTube Bulk Uploader</h1>
+    <span id="pill" class="pill">…</span>
+    <div class="spacer"></div>
+    <button id="btn-run">Upload now</button>
+    <button id="btn-stop" hidden>Stop</button>
+    <button id="btn-pause"></button>
+  </header>
+
+  <section id="banner" class="banner" hidden></section>
+
+  <section class="stats">
+    <div class="stat"><div class="n" id="s-up">0</div><div class="l">uploaded</div></div>
+    <div class="stat"><div class="n" id="s-pend">0</div><div class="l">remaining</div></div>
+    <div class="stat"><div class="n" id="s-fail">0</div><div class="l">failed</div></div>
+    <div class="stat"><div class="n" id="s-today">0</div><div class="l">today (Pacific)</div></div>
+  </section>
+
+  <section id="current" class="current" hidden>
+    <div id="cur-title"></div>
+    <div class="bar"><div id="cur-bar"></div></div>
+    <div id="cur-meta" class="muted"></div>
+  </section>
+
+  <nav>
+    <button data-tab="recent" class="active">Uploaded</button>
+    <button data-tab="queue">Queue</button>
+    <button data-tab="failed">Failed</button>
+    <button data-tab="log">Log</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <div id="tab-recent" class="tab"></div>
+    <div id="tab-queue" class="tab" hidden></div>
+    <div id="tab-failed" class="tab" hidden></div>
+    <pre id="tab-log" class="tab" hidden></pre>
+    <div id="tab-settings" class="tab" hidden>
+      <label>Source folder
+        <div class="row"><input id="f-root" readonly><button id="btn-folder">Choose…</button></div>
+      </label>
+      <label>Daily upload cap <input id="f-cap" type="number" min="1" max="100"></label>
+      <label>Visibility
+        <select id="f-privacy"><option>unlisted</option><option>private</option><option>public</option></select>
+      </label>
+      <label>Auto-run every (minutes, 0 = manual only) <input id="f-auto" type="number" min="0"></label>
+      <div class="row">
+        <button id="btn-save">Save settings</button>
+        <button id="btn-retry">Retry failed uploads</button>
+      </div>
+      <h3>YouTube account</h3>
+      <div id="auth-status" class="muted"></div>
+      <div class="row">
+        <button id="btn-secret">Import client_secret.json…</button>
+        <button id="btn-signin">Sign in</button>
+        <button id="btn-signout">Sign out</button>
+      </div>
+    </div>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

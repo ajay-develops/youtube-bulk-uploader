@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ajay.devsarohayoutubeupload</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/dev/dev-saroha-youtube-upload/scripts/upload.py</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/dev/dev-saroha-youtube-upload/logs/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dev/dev-saroha-youtube-upload/logs/launchd_stderr.log</string>
+</dict>
+</plist>
